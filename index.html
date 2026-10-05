@@ -1,0 +1,735 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Ghoul Duel Clone</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#0b0b14;overflow:hidden;
+    font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+    -webkit-user-select:none;user-select:none;touch-action:none;}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;}
+  #stage{position:relative;}
+  canvas{display:block;background:#141422;border-radius:8px;max-width:100vw;max-height:100vh;}
+  #hud{position:absolute;top:0;left:0;right:0;display:flex;align-items:center;gap:8px;
+    padding:8px 12px;pointer-events:none;}
+  .bar{flex:1;height:14px;background:#22222f;border-radius:7px;overflow:hidden;}
+  .bar>i{display:block;height:100%;width:50%;border-radius:7px;transition:width .2s;}
+  #barG>i{background:#3ddc84;} #barP>i{background:#b478ff;}
+  #timer{min-width:64px;text-align:center;color:#fff;font-weight:700;font-size:18px;
+    background:#22222f;border-radius:8px;padding:2px 10px;}
+  .score{color:#fff;font-weight:700;min-width:28px;text-align:center;}
+  .overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;
+    justify-content:center;background:rgba(8,8,16,.84);color:#fff;text-align:center;
+    border-radius:8px;cursor:pointer;}
+  .overlay h1{margin:0 0 8px;font-size:42px;letter-spacing:2px;}
+  .overlay p{margin:6px 0;color:#b9b9d6;max-width:440px;line-height:1.5;padding:0 16px;}
+  .overlay .big{font-size:22px;font-weight:700;color:#fff;}
+  .hidden{display:none !important;}
+  kbd{background:#22222f;border-radius:4px;padding:1px 7px;border:1px solid #3a3a52;}
+</style>
+</head>
+<body>
+<div id="wrap"><div id="stage">
+  <canvas id="game" width="840" height="600"></canvas>
+  <div id="hud">
+    <div class="score" id="scoreG">0</div>
+    <div class="bar" id="barG"><i></i></div>
+    <div id="timer">2:00</div>
+    <div class="bar" id="barP"><i></i></div>
+    <div class="score" id="scoreP">0</div>
+  </div>
+  <div class="overlay" id="title">
+    <h1>GHOUL DUEL</h1>
+    <p>Collect spirit flames — they trail behind you. Bank them in your corner pool.
+       Ram enemy tails to steal their flames. Grab the jack-o'-lantern to turn the tables.</p>
+    <p>Move: <kbd>WASD</kbd> / <kbd>&larr;&uarr;&darr;&rarr;</kbd> or touch-drag
+       &nbsp;&bull;&nbsp; <kbd>Space</kbd>: speed burst</p>
+    <p class="big">Click to start</p>
+  </div>
+  <div class="overlay hidden" id="over">
+    <h1 id="overTitle">Green wins!</h1>
+    <p id="overSub"></p>
+    <p class="big">Click to play again</p>
+  </div>
+</div></div>
+<script>
+'use strict';
+/* ============================================================================
+   GHOUL DUEL CLONE — everything lives in this one file.
+   Art lives in the separate assets/ folder (see assets/README.txt).
+   Sections:
+     1. CONFIG            — the modding surface: tune the game here
+     2. TILE LEGEND+MAP   — the arena as a grid of numbers (bots read this too)
+     3. ASSETS            — loader + generated placeholder sprites
+     4. INPUT             — keyboard + touch
+     5. MAP HELPERS       — tile lookups
+     6. ENTITIES & STATE  — ghosts, flames, match state
+     7. RULES             — pickup / steal / bank / jack-o'-lantern / defeat
+     8. ABILITIES         — data-driven; v1 ships one (speed burst)
+     9. BOTS              — AI: BFS pathfinding straight on the tile grid
+    10. UPDATE            — fixed-timestep game logic
+    11. RENDER            — canvas 2D, static sprites only (no animation)
+    12. HUD & SCREENS     — DOM overlay
+    13. MAIN LOOP & BOOT
+   ============================================================================ */
+
+/* ---------------- 1. CONFIG ----------------
+   Change numbers here to mod the game. No logic below depends on hardcoded
+   values — everything tunable lives in this object. */
+const CFG = {
+  tile: 40,               // pixels per map tile
+  matchTime: 120,         // seconds per match
+  teamSize: 4,            // ghosts per team (green includes you)
+  ghostSpeed: 170,        // px/sec
+  botSpeedFactor: 0.97,   // bots are a hair slower than you
+  ghostRadius: 13,
+  segmentsPerFlame: 6,    // trail segments added per carried flame
+  baseTrail: 5,           // trail segments with zero flames
+  trailSpacing: 5,        // px between trail points
+  stealStun: 1.0,          // seconds a steal victim can't move
+  stealMinIndex: 8,       // trail points before this are "head", can't be hit
+  carrySpeedBonus: 0.02,  // +2% speed per carried flame (risk/reward)
+  carrySpeedCap: 1.3,     // max speed multiplier from carrying
+  flameSpawnInterval: 1.1,
+  maxFlames: 14,          // max loose flames on the map
+  initialFlames: 10,
+  jackInterval: 22,       // seconds between jack-o'-lantern spawns
+  jackDuration: 8,        // invincibility seconds after pickup
+  burstCooldown: 8,
+  burstDuration: 1.5,
+  burstMult: 1.85,
+  bankThreshold: 6,       // bots head home carrying this many flames
+  botThink: 0.15,         // seconds between bot decisions
+};
+
+const TEAMS = {
+  green:  { name: 'Green',  color: '#3ddc84', dark: '#1e8f52', baseTile: 3 },
+  purple: { name: 'Purple', color: '#b478ff', dark: '#6f3fb5', baseTile: 4 },
+};
+
+/* ---------------- 2. TILE LEGEND + MAP ----------------
+   The whole arena is a grid of numbers. Everyone — renderer, collision,
+   AND the bots — reads this same grid, so bots "see" the map like a player.
+     0 = empty floor        1 = wall (collision)
+     2 = flame spawn point  3 = green base      4 = purple base
+     5 = jack-o'-lantern spawn
+   11 = UNKNOWN — reserved. Meaning: a square the bot has not seen yet
+        (future fog-of-war). NOT USED in any map below and no logic reads it.
+        Future plan: mark unexplored squares 11, exclude them from bot BFS
+        until explored; bots explore by pathing in a circle around unknown
+        regions to reveal them. That also makes bots play dumber/more human
+        (no perfect map knowledge). */
+const T_EMPTY = 0, T_WALL = 1, T_SPAWN = 2;
+const T_BASE_G = 3, T_BASE_P = 4, T_JACK = 5;
+const T_UNKNOWN = 11; // reserved, see note above
+
+// 21 x 15 arena, 180-degree rotationally symmetric (fair for both teams).
+const MAP = [
+[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+[1,3,3,0,0,0,0,0,0,0,2,0,0,0,0,0,0,0,0,0,1],
+[1,0,0,0,0,0,0,0,0,0,2,0,0,0,0,0,0,0,2,0,1],
+[1,0,0,0,0,1,1,0,2,0,0,0,2,0,1,1,0,0,0,0,1],
+[1,0,0,0,0,1,1,0,0,0,2,0,0,0,1,1,0,0,0,0,1],
+[1,0,0,2,0,0,0,0,0,0,2,0,0,0,0,0,0,2,0,0,1],
+[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+[1,0,0,2,1,1,1,2,0,0,5,0,0,2,1,1,1,2,0,0,1],
+[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+[1,0,0,2,0,0,0,0,0,0,2,0,0,0,0,0,0,2,0,0,1],
+[1,0,0,0,0,1,1,0,0,0,2,0,0,0,1,1,0,0,0,0,1],
+[1,0,0,0,0,1,1,0,2,0,0,0,2,0,1,1,0,0,0,0,1],
+[1,0,2,0,0,0,0,0,0,0,2,0,0,0,0,0,0,0,0,0,1],
+[1,0,0,0,0,0,0,0,0,0,2,0,0,0,0,0,0,0,4,4,1],
+[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+];
+
+/* ---------------- 3. ASSETS ----------------
+   Tries assets/<name>.png for each sprite. Anything missing (the folder is
+   empty for now) becomes a generated placeholder shape, so the game always
+   runs. To reskin: drop PNGs with these filenames into assets/ — no code
+   changes needed. */
+const ASSET_FILES = {
+  'ghost-green':  'assets/ghost-green.png',
+  'ghost-purple': 'assets/ghost-purple.png',
+  'flame':        'assets/flame.png',
+  'jack':         'assets/jackolantern.png',
+};
+const sprites = {};
+
+function makePlaceholder(name) {
+  const c = document.createElement('canvas');
+  const x = c.getContext('2d');
+  if (name === 'flame') {
+    c.width = c.height = 32;
+    x.fillStyle = '#ff9d2e';
+    x.beginPath(); x.moveTo(16,2); x.lineTo(30,16); x.lineTo(16,30); x.lineTo(2,16);
+    x.closePath(); x.fill();
+    x.fillStyle = '#ffe36e';
+    x.beginPath(); x.moveTo(16,9); x.lineTo(23,16); x.lineTo(16,23); x.lineTo(9,16);
+    x.closePath(); x.fill();
+  } else if (name === 'jack') {
+    c.width = c.height = 40;
+    x.fillStyle = '#8a5a1e'; x.fillRect(18,2,5,8);            // stem
+    x.fillStyle = '#ff8c1a';
+    x.beginPath(); x.arc(20,22,16,0,Math.PI*2); x.fill();      // pumpkin
+    x.fillStyle = '#1a1a1a';
+    x.beginPath(); x.moveTo(10,16); x.lineTo(15,16); x.lineTo(12.5,21); x.closePath(); x.fill();
+    x.beginPath(); x.moveTo(25,16); x.lineTo(30,16); x.lineTo(27.5,21); x.closePath(); x.fill();
+    x.fillRect(11,26,18,4);                                   // grin
+  } else { // ghost-green / ghost-purple
+    const team = name === 'ghost-green' ? TEAMS.green : TEAMS.purple;
+    c.width = c.height = 48;
+    x.fillStyle = team.dark;
+    x.beginPath(); x.arc(24,24,22,0,Math.PI*2); x.fill();
+    x.fillStyle = team.color;
+    x.beginPath(); x.arc(24,24,19,0,Math.PI*2); x.fill();
+    x.fillStyle = '#ffffff';
+    x.beginPath(); x.arc(16,20,6,0,Math.PI*2); x.fill();
+    x.beginPath(); x.arc(32,20,6,0,Math.PI*2); x.fill();
+    x.fillStyle = '#1a1a2e';
+    x.beginPath(); x.arc(16,21,2.6,0,Math.PI*2); x.fill();
+    x.beginPath(); x.arc(32,21,2.6,0,Math.PI*2); x.fill();
+  }
+  return c;
+}
+
+function loadOne(name) {
+  return new Promise((res) => {
+    let done = false;
+    const fin = (s) => { if (done) return; done = true; sprites[name] = s; res(); };
+    let img;
+    try { img = new Image(); } catch (e) { fin(makePlaceholder(name)); return; }
+    img.onload = () => fin(img);
+    img.onerror = () => fin(makePlaceholder(name));
+    try { img.src = ASSET_FILES[name]; } catch (e) { fin(makePlaceholder(name)); }
+    setTimeout(() => fin(makePlaceholder(name)), 2500); // never hang the boot
+  });
+}
+function loadAssets() {
+  return Promise.all(Object.keys(ASSET_FILES).map(loadOne));
+}
+
+/* ---------------- 4. INPUT ---------------- */
+const input = { keys: {}, dir: { x: 0, y: 0 }, burst: false,
+                touchActive: false, touchSX: 0, touchSY: 0 };
+function readKeys() {
+  let x = 0, y = 0;
+  const k = input.keys;
+  if (k['ArrowLeft'] || k['a'] || k['A']) x -= 1;
+  if (k['ArrowRight'] || k['d'] || k['D']) x += 1;
+  if (k['ArrowUp'] || k['w'] || k['W']) y -= 1;
+  if (k['ArrowDown'] || k['s'] || k['S']) y += 1;
+  if (x || y) { const d = Math.hypot(x, y); input.dir = { x: x / d, y: y / d }; }
+  else if (!input.touchActive) input.dir = { x: 0, y: 0 };
+}
+
+/* ---------------- 5. MAP HELPERS ---------------- */
+const ROWS = MAP.length, COLS = MAP[0].length;
+const W = COLS * CFG.tile, H = ROWS * CFG.tile;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+function tileAtPx(x, y) {
+  const c = Math.floor(x / CFG.tile), r = Math.floor(y / CFG.tile);
+  if (c < 0 || r < 0 || c >= COLS || r >= ROWS) return T_WALL;
+  return MAP[r][c];
+}
+// T_UNKNOWN (11) counts as walkable: no 11-tiles exist in maps yet (see legend).
+function walkable(c, r) {
+  if (c < 0 || r < 0 || c >= COLS || r >= ROWS) return false;
+  return MAP[r][c] !== T_WALL;
+}
+function tilesOf(v) {
+  const out = [];
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++)
+    if (MAP[r][c] === v) out.push({ c, r });
+  return out;
+}
+const tileCenter = (c, r) => ({ x: (c + 0.5) * CFG.tile, y: (r + 0.5) * CFG.tile });
+
+/* ---------------- 6. ENTITIES & STATE ---------------- */
+let ghosts = [], flames = [];
+let jack = { active: false, x: 0, y: 0 };
+let scores = { green: 0, purple: 0 };
+let timeLeft = CFG.matchTime, phase = 'title';
+let spawnT = 0, jackT = 0;
+
+function makeGhost(team, isBot, sx, sy) {
+  return {
+    team, isBot, x: sx, y: sy,
+    dir: { x: 0, y: 0 }, trail: [], carried: 0,
+    stun: 0, invincible: 0, burst: 0, cooldown: 0, bonusCd: 0,
+    path: null, pathI: 0, targetPos: null, mode: 'seek',
+    thinkT: Math.random() * CFG.botThink,
+  };
+}
+
+function spawnFlame() {
+  if (flames.length >= CFG.maxFlames) return;
+  const spots = tilesOf(T_SPAWN);
+  const s = spots[(Math.random() * spots.length) | 0];
+  const p = tileCenter(s.c, s.r);
+  flames.push({ x: p.x + (Math.random() * 10 - 5), y: p.y + (Math.random() * 10 - 5) });
+}
+function spawnJack() {
+  if (jack.active) return;
+  const spots = tilesOf(T_JACK);
+  if (!spots.length) return;
+  const p = tileCenter(spots[0].c, spots[0].r);
+  jack = { active: true, x: p.x, y: p.y };
+}
+
+function buildLevel() {
+  ghosts = []; flames = [];
+  jack = { active: false, x: 0, y: 0 };
+  scores = { green: 0, purple: 0 };
+  timeLeft = CFG.matchTime; spawnT = 0; jackT = CFG.jackInterval * 0.5;
+  const gTiles = tilesOf(T_BASE_G), pTiles = tilesOf(T_BASE_P);
+  const spots = [];
+  for (let i = 0; i < CFG.teamSize; i++) {
+    const t = gTiles[i % gTiles.length], p = tileCenter(t.c, t.r);
+    spots.push({ team: 'green', x: p.x, y: p.y, bot: i !== 0 }); // spots[0] = you
+  }
+  for (let i = 0; i < CFG.teamSize; i++) {
+    const t = pTiles[i % pTiles.length], p = tileCenter(t.c, t.r);
+    spots.push({ team: 'purple', x: p.x, y: p.y, bot: true });
+  }
+  for (const s of spots) ghosts.push(makeGhost(s.team, s.bot, s.x, s.y));
+  for (let i = 0; i < CFG.initialFlames; i++) spawnFlame();
+}
+
+/* ---------------- 7. RULES ----------------
+   The whole game is three interactions:
+   - PICKUP: touch a loose flame -> it joins your trail (grows it).
+   - STEAL:  ram an enemy's trail (past the head) -> you take every flame
+             from the contact point backward; victim is stunned.
+   - BANK:   enter your own base with flames -> team scores.
+   Plus the jack-o'-lantern: pickup -> brief invincibility + you can defeat
+   rivals (sent back to their base, trail wiped). No lives otherwise. */
+function ghostSpeed(g) {
+  let s = CFG.ghostSpeed;
+  if (g.burst > 0) s *= CFG.burstMult;
+  s *= Math.min(CFG.carrySpeedCap, 1 + g.carried * CFG.carrySpeedBonus);
+  if (g.isBot) s *= CFG.botSpeedFactor;
+  return s;
+}
+function hitsWall(x, y) {
+  const r = CFG.ghostRadius;
+  return tileAtPx(x - r, y - r) === T_WALL || tileAtPx(x + r, y - r) === T_WALL ||
+         tileAtPx(x - r, y + r) === T_WALL || tileAtPx(x + r, y + r) === T_WALL;
+}
+function moveGhost(g, dx, dy, dt) {
+  if (!dx && !dy) return;
+  const s = ghostSpeed(g);
+  const nx = g.x + dx * s * dt;
+  if (!hitsWall(nx, g.y)) g.x = nx;
+  const ny = g.y + dy * s * dt;
+  if (!hitsWall(g.x, ny)) g.y = ny;
+  g.x = clamp(g.x, CFG.ghostRadius, W - CFG.ghostRadius);
+  g.y = clamp(g.y, CFG.ghostRadius, H - CFG.ghostRadius);
+}
+function updateTrail(g) {
+  const head = { x: g.x, y: g.y };
+  const last = g.trail[0];
+  if (!last || Math.hypot(last.x - head.x, last.y - head.y) >= CFG.trailSpacing)
+    g.trail.unshift(head);
+  const target = CFG.baseTrail + g.carried * CFG.segmentsPerFlame;
+  while (g.trail.length > target) g.trail.pop();
+}
+// first trail index of B (past the head region) within steal range of A's head
+function trailHit(A, B) {
+  const rr = CFG.ghostRadius * CFG.stealRadius;
+  for (let i = CFG.stealMinIndex; i < B.trail.length; i += 1) {
+    const p = B.trail[i];
+    const dx = A.x - p.x, dy = A.y - p.y;
+    if (dx * dx + dy * dy < rr * rr) return i;
+  }
+  return -1;
+}
+function steal(A, B, hit) {
+  let stolen = Math.ceil((B.trail.length - hit) / CFG.segmentsPerFlame);
+  stolen = clamp(stolen, 0, B.carried);
+  if (stolen <= 0) return;
+  B.carried -= stolen;
+  A.carried += stolen;
+  const target = CFG.baseTrail + B.carried * CFG.segmentsPerFlame;
+  B.trail.length = Math.min(hit, target);
+  B.stun = CFG.stealStun;
+  B.path = null; // victim re-plans
+}
+function defeat(B) {
+  const t = tilesOf(TEAMS[B.team].baseTile)[0];
+  const p = tileCenter(t.c, t.r);
+  B.x = p.x; B.y = p.y;
+  B.carried = 0; B.trail.length = 0;
+  B.stun = 1.0; B.path = null;
+}
+function teammateBonus(A, B) {
+  if (A === B || A.bonusCd > 0) return;
+  if (trailHit(A, B) >= 0) { A.carried += 1; A.bonusCd = 1.0; }
+}
+function tryBurst(g) {
+  if (g.cooldown <= 0 && g.stun <= 0) {
+    g.burst = CFG.burstDuration;
+    g.cooldown = CFG.burstCooldown;
+  }
+}
+
+function interactions() {
+  const R = CFG.ghostRadius;
+  for (const g of ghosts) {
+    // flame pickup
+    for (let i = flames.length - 1; i >= 0; i--) {
+      const f = flames[i], dx = g.x - f.x, dy = g.y - f.y;
+      if (dx * dx + dy * dy < (R + 9) * (R + 9)) { flames.splice(i, 1); g.carried++; }
+    }
+    // jack-o'-lantern pickup
+    if (jack.active) {
+      const dx = g.x - jack.x, dy = g.y - jack.y;
+      if (dx * dx + dy * dy < (R + 12) * (R + 12)) {
+        jack.active = false; g.invincible = CFG.jackDuration;
+      }
+    }
+    // banking
+    if (tileAtPx(g.x, g.y) === TEAMS[g.team].baseTile && g.carried > 0) {
+      scores[g.team] += g.carried;
+      g.carried = 0;
+    }
+  }
+  // ghost vs ghost
+  for (let ai = 0; ai < ghosts.length; ai++) {
+    const A = ghosts[ai];
+    if (A.stun > 0) continue;
+    for (let bi = 0; bi < ghosts.length; bi++) {
+      if (ai === bi) continue;
+      const B = ghosts[bi];
+      if (A.team === B.team) { teammateBonus(A, B); continue; }
+      const dx = A.x - B.x, dy = A.y - B.y;
+      const headTouch = dx * dx + dy * dy < (2 * R) * (2 * R);
+      const ti = trailHit(A, B);
+      if (A.invincible > 0) {
+        if (headTouch || ti >= 0) defeat(B); // power trip: rival goes home empty
+        continue;
+      }
+      if (B.invincible > 0) continue;       // immune while powered
+      if (ti >= 0) steal(A, B, ti);
+    }
+  }
+}
+
+/* ---------------- 8. ABILITIES ----------------
+   Data-driven: a new ability is a new entry here, not new code.
+   v1 ships exactly one (speed burst on Space) to prove the hook. */
+const ABILITIES = [
+  { id: 'burst', key: 'Space', cooldown: CFG.burstCooldown,
+    duration: CFG.burstDuration, desc: 'Brief speed burst' },
+];
+
+/* ---------------- 9. BOTS ----------------
+   Bots read the same number grid as everyone else and pathfind on it with
+   BFS, so they route around walls like a player instead of bumping into
+   them. Decision runs a few times per second (thinkT); steering runs every
+   frame toward the next waypoint (tile center).
+
+   NOTE on T_UNKNOWN (11): no map uses it yet, and walkable() treats it as
+   open. When fog-of-war lands: bots must EXCLUDE 11-tiles from BFS until
+   explored, and explore by circling around unknown regions to reveal them —
+   that's what will make bots play dumber/more human. */
+function bfs(s, g) {
+  if (s.c === g.c && s.r === g.r) return [];
+  const key = (c, r) => r * COLS + c;
+  const prev = new Map(), seen = new Set([key(s.c, s.r)]);
+  const q = [{ c: s.c, r: s.r }];
+  const dirs = [[1,0],[-1,0],[0,1],[0,-1]];
+  while (q.length) {
+    const cur = q.shift();
+    for (const [dc, dr] of dirs) {
+      const nc = cur.c + dc, nr = cur.r + dr;
+      if (!walkable(nc, nr)) continue;
+      const k = key(nc, nr);
+      if (seen.has(k)) continue;
+      seen.add(k); prev.set(k, cur);
+      if (nc === g.c && nr === g.r) {
+        const path = [];
+        let node = { c: nc, r: nr };
+        while (node) { path.unshift(node); node = prev.get(key(node.c, node.r)); }
+        return path; // goal..start excluded; waypoints to follow
+      }
+      q.push({ c: nc, r: nr });
+    }
+  }
+  return null; // unreachable: steering falls back to direct heading
+}
+function nearestFlame(b) {
+  let best = null, bd = Infinity;
+  for (const f of flames) {
+    const d = Math.hypot(f.x - b.x, f.y - f.y);
+    if (d < bd) { bd = d; best = f; }
+  }
+  return best;
+}
+function nearestBaseCenter(team, x, y) {
+  let best = null, bd = Infinity;
+  for (const t of tilesOf(TEAMS[team].baseTile)) {
+    const p = tileCenter(t.c, t.r);
+    const d = Math.hypot(p.x - x, p.y - y);
+    if (d < bd) { bd = d; best = p; }
+  }
+  return best;
+}
+// closest point on any rival trail within maxD (for interceptions)
+function nearestPreyTrail(b, maxD) {
+  let best = null, bd = maxD;
+  for (const o of ghosts) {
+    if (o.team === b.team || o.invincible > 0) continue;
+    for (let i = CFG.stealMinIndex; i < o.trail.length; i += 3) {
+      const p = o.trail[i];
+      const d = Math.hypot(p.x - b.x, p.y - b.y);
+      if (d < bd) { bd = d; best = p; }
+    }
+  }
+  return best;
+}
+function botThink(b) {
+  // 1. flee powered-up enemies
+  let threat = null, td = Infinity;
+  for (const o of ghosts) {
+    if (o.team === b.team || o.invincible <= 0) continue;
+    const d = Math.hypot(o.x - b.x, o.y - b.y);
+    if (d < td) { td = d; threat = o; }
+  }
+  let tp = null;
+  if (threat && td < 240)            { tp = nearestBaseCenter(b.team, b.x, b.y); b.mode = 'flee'; }
+  else if (b.carried >= CFG.bankThreshold) { tp = nearestBaseCenter(b.team, b.x, b.y); b.mode = 'bank'; }
+  else {
+    const fl = nearestFlame(b);
+    const prey = nearestPreyTrail(b, 140);
+    if (prey && b.carried < 4) { tp = { x: prey.x, y: prey.y }; b.mode = 'hunt'; }
+    else if (jack.active && fl) {
+      const dj = Math.hypot(jack.x - b.x, jack.y - b.y);
+      const df = Math.hypot(fl.x - b.x, fl.y - b.y);
+      if (dj < df * 1.3) { tp = { x: jack.x, y: jack.y }; b.mode = 'jack'; }
+      else { tp = fl; b.mode = 'seek'; }
+    }
+    else if (fl) { tp = fl; b.mode = 'seek'; }
+    else { tp = nearestBaseCenter(b.team, b.x, b.y); b.mode = 'idle'; }
+  }
+  b.targetPos = tp;
+  if (tp) {
+    const s = { c: clamp(Math.floor(b.x / CFG.tile), 0, COLS - 1),
+                r: clamp(Math.floor(b.y / CFG.tile), 0, ROWS - 1) };
+    const g = { c: clamp(Math.floor(tp.x / CFG.tile), 0, COLS - 1),
+                r: clamp(Math.floor(tp.y / CFG.tile), 0, ROWS - 1) };
+    b.path = bfs(s, g); b.pathI = 0;
+  } else b.path = null;
+}
+function botSteer(b) {
+  if (b.path && b.pathI < b.path.length) {
+    const wp = b.path[b.pathI];
+    const cx = (wp.c + 0.5) * CFG.tile, cy = (wp.r + 0.5) * CFG.tile;
+    const dx = cx - b.x, dy = cy - b.y, d = Math.hypot(dx, dy);
+    if (d < 8) { b.pathI++; return; }
+    b.dir = { x: dx / d, y: dy / d };
+    return;
+  }
+  if (b.targetPos) { // no path (or done): head straight at the target
+    const dx = b.targetPos.x - b.x, dy = b.targetPos.y - b.y, d = Math.hypot(dx, dy);
+    b.dir = d > 4 ? { x: dx / d, y: dy / d } : { x: 0, y: 0 };
+  } else b.dir = { x: 0, y: 0 };
+}
+
+/* ---------------- 10. UPDATE ---------------- */
+function update(dt) {
+  if (phase !== 'playing') return;
+  timeLeft -= dt;
+  if (timeLeft <= 0) { timeLeft = 0; endGame(); return; }
+  spawnT -= dt;
+  if (spawnT <= 0) { spawnT = CFG.flameSpawnInterval; spawnFlame(); }
+  jackT -= dt;
+  if (jackT <= 0) { jackT = CFG.jackInterval; spawnJack(); }
+
+  readKeys();
+  const player = ghosts[0];
+  if (input.burst) { input.burst = false; tryBurst(player); }
+
+  for (const g of ghosts) {
+    if (!g.isBot) continue;
+    g.thinkT -= dt;
+    if (g.thinkT <= 0) { g.thinkT = CFG.botThink + Math.random() * 0.06; botThink(g); }
+    botSteer(g);
+  }
+  for (const g of ghosts) {
+    g.stun = Math.max(0, g.stun - dt);
+    g.invincible = Math.max(0, g.invincible - dt);
+    g.burst = Math.max(0, g.burst - dt);
+    g.cooldown = Math.max(0, g.cooldown - dt);
+    g.bonusCd = Math.max(0, g.bonusCd - dt);
+    if (g.stun <= 0) {
+      const d = g.isBot ? g.dir : input.dir;
+      moveGhost(g, d.x, d.y, dt);
+    }
+    updateTrail(g);
+  }
+  interactions();
+  updateHud();
+}
+
+/* ---------------- 11. RENDER ----------------
+   Static sprites only — no animation frames, no particles. */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+function drawTiles() {
+  const t = CFG.tile;
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    const v = MAP[r][c], x = c * t, y = r * t;
+    if (v === T_WALL) {
+      ctx.fillStyle = '#2b2b44'; ctx.fillRect(x, y, t, t);
+      ctx.fillStyle = '#34345a'; ctx.fillRect(x + 3, y + 3, t - 6, t - 6);
+    } else {
+      ctx.fillStyle = '#141422'; ctx.fillRect(x, y, t, t);
+      if (v === T_BASE_G || v === T_BASE_P) {
+        const team = v === T_BASE_G ? TEAMS.green : TEAMS.purple;
+        ctx.globalAlpha = 0.35; ctx.fillStyle = team.color;
+        ctx.fillRect(x, y, t, t); ctx.globalAlpha = 1;
+      } else if (v === T_SPAWN) {
+        ctx.fillStyle = '#2e2e48';
+        ctx.beginPath(); ctx.arc(x + t / 2, y + t / 2, 3, 0, Math.PI * 2); ctx.fill();
+      } else if (v === T_JACK) {
+        ctx.fillStyle = '#5a3a1e';
+        ctx.beginPath(); ctx.arc(x + t / 2, y + t / 2, 4, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+  }
+}
+function drawTrail(g) {
+  const team = TEAMS[g.team], n = g.trail.length;
+  if (n < 2) return;
+  ctx.fillStyle = team.color;
+  for (let i = n - 1; i >= 1; i--) {
+    const f = i / n;
+    ctx.globalAlpha = 0.85 * (1 - f) + 0.15;
+    ctx.beginPath();
+    ctx.arc(g.trail[i].x, g.trail[i].y, 10 * (1 - f) + 2.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function drawGhost(g) {
+  const s = 36, img = sprites['ghost-' + g.team];
+  if (img) ctx.drawImage(img, g.x - s / 2, g.y - s / 2, s, s);
+  if (g.invincible > 0) { // jack-o'-lantern power ring (static)
+    ctx.strokeStyle = '#ffd23e'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(g.x, g.y, 22, 0, Math.PI * 2); ctx.stroke();
+  }
+}
+function render() {
+  ctx.fillStyle = '#141422'; ctx.fillRect(0, 0, W, H);
+  drawTiles();
+  const fs = sprites['flame'];
+  if (fs) for (const f of flames) ctx.drawImage(fs, f.x - 11, f.y - 11, 22, 22);
+  if (jack.active) {
+    const js = sprites['jack'];
+    if (js) ctx.drawImage(js, jack.x - 15, jack.y - 15, 30, 30);
+  }
+  for (const g of ghosts) drawTrail(g);
+  for (const g of ghosts) drawGhost(g);
+}
+
+/* ---------------- 12. HUD & SCREENS ---------------- */
+const el = (id) => document.getElementById(id);
+const hud = { sec: -1, g: -1, p: -1 };
+function updateHud(force) {
+  const sec = Math.ceil(timeLeft);
+  if (force || sec !== hud.sec) {
+    hud.sec = sec;
+    el('timer').textContent = Math.floor(sec / 60) + ':' + String(sec % 60).padStart(2, '0');
+  }
+  if (force || scores.green !== hud.g || scores.purple !== hud.p) {
+    hud.g = scores.green; hud.p = scores.purple;
+    el('scoreG').textContent = scores.green;
+    el('scoreP').textContent = scores.purple;
+    const tot = scores.green + scores.purple;
+    const gp = tot ? (scores.green / tot) * 100 : 50;
+    el('barG').firstElementChild.style.width = gp + '%';
+    el('barP').firstElementChild.style.width = (100 - gp) + '%';
+  }
+}
+function startGame() {
+  buildLevel();
+  phase = 'playing';
+  el('title').classList.add('hidden');
+  el('over').classList.add('hidden');
+  updateHud(true);
+}
+function endGame() {
+  phase = 'over';
+  const g = scores.green, p = scores.purple;
+  el('overTitle').textContent =
+    g > p ? 'Green wins!' : p > g ? 'Purple wins!' : "It's a draw!";
+  el('overSub').textContent = 'Final score — Green ' + g + ' : ' + p + ' Purple';
+  el('over').classList.remove('hidden');
+}
+
+/* ---------------- 13. MAIN LOOP & BOOT ---------------- */
+let last = 0, acc = 0;
+const DT = 1 / 60;
+function frame(t) {
+  requestAnimationFrame(frame);
+  if (!last) last = t;
+  let dt = (t - last) / 1000; last = t;
+  if (dt > 0.25) dt = 0.25;
+  acc += dt;
+  while (acc >= DT) { update(DT); acc -= DT; }
+  render();
+}
+
+function wireInput() {
+  window.addEventListener('keydown', (e) => {
+    if ([' ', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key))
+      e.preventDefault();
+    input.keys[e.key] = true;
+    if (e.code === 'Space' || e.key === ' ') input.burst = true;
+  });
+  window.addEventListener('keyup', (e) => { input.keys[e.key] = false; });
+  window.addEventListener('blur', () => { input.keys = {}; });
+  canvas.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    const t = e.changedTouches[0];
+    input.touchActive = true; input.touchSX = t.clientX; input.touchSY = t.clientY;
+  }, { passive: false });
+  canvas.addEventListener('touchmove', (e) => {
+    e.preventDefault();
+    const t = e.changedTouches[0];
+    const dx = t.clientX - input.touchSX, dy = t.clientY - input.touchSY;
+    const d = Math.hypot(dx, dy);
+    input.dir = d > 12 ? { x: dx / d, y: dy / d } : { x: 0, y: 0 };
+  }, { passive: false });
+  const endTouch = () => {
+    input.touchActive = false;
+    if (!Object.keys(input.keys).some((k) => input.keys[k])) input.dir = { x: 0, y: 0 };
+  };
+  canvas.addEventListener('touchend', endTouch);
+  canvas.addEventListener('touchcancel', endTouch);
+  el('title').addEventListener('click', startGame);
+  el('over').addEventListener('click', startGame);
+}
+
+// Small debug/modding handle (also used by automated smoke tests).
+window.GG = {
+  CFG, TEAMS, input,
+  api: {
+    start: startGame,
+    step: (dt) => { update(dt); render(); },
+    get state() { return { ghosts, flames, jack, scores, timeLeft, phase }; },
+  },
+};
+
+loadAssets().then(() => {
+  wireInput();
+  buildLevel();      // arena backdrop behind the title screen
+  render();
+  requestAnimationFrame(frame);
+});
+</script>
+</body>
+</html>
